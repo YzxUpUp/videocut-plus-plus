@@ -27,8 +27,8 @@ cat > "$contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>CFBundleIdentifier</key><string>com.videocutplusplus.desktop</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.2</string>
-  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>1.3</string>
+  <key>CFBundleVersion</key><string>4</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>

@@ -16,32 +16,84 @@ struct VideoCutApp: App {
     }
 }
 
-private let canvas = Color(red: 0.072, green: 0.085, blue: 0.094)
-private let panel = Color(red: 0.108, green: 0.128, blue: 0.137)
-private let accent = Color(red: 0.53, green: 0.92, blue: 0.77)
-private let rule = Color.white.opacity(0.09)
+private enum AppearanceMode: String, CaseIterable {
+    case system, light, dark
+
+    var title: String {
+        switch self {
+        case .system: "跟随系统"
+        case .light: "明亮"
+        case .dark: "黑暗"
+        }
+    }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+}
+
+private struct Palette {
+    static let selection = Color(red: 0.53, green: 0.92, blue: 0.77)
+
+    let canvas: Color
+    let panel: Color
+    let accent: Color
+    let rule: Color
+    let emptyPreview: Color
+    let warning: Color
+
+    init(_ scheme: ColorScheme) {
+        if scheme == .dark {
+            canvas = Color(red: 0.072, green: 0.085, blue: 0.094)
+            panel = Color(red: 0.108, green: 0.128, blue: 0.137)
+            accent = Self.selection
+            rule = .white.opacity(0.09)
+            emptyPreview = .black.opacity(0.38)
+            warning = .orange
+        } else {
+            canvas = Color(red: 0.94, green: 0.96, blue: 0.96)
+            panel = .white
+            accent = Color(red: 0.04, green: 0.40, blue: 0.31)
+            rule = .black.opacity(0.12)
+            emptyPreview = Color(red: 0.89, green: 0.92, blue: 0.92)
+            warning = Color(red: 0.59, green: 0.28, blue: 0.06)
+        }
+    }
+}
 
 struct Editor: View {
     @ObservedObject var workspace: Workspace
     @StateObject private var ui = EditorState()
+    @AppStorage("appearanceMode") private var appearance = AppearanceMode.system
+    @Environment(\.colorScheme) private var colorScheme
+    private var palette: Palette { Palette(colorScheme) }
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().overlay(rule)
+            Divider().overlay(palette.rule)
             HStack(alignment: .top, spacing: 18) {
                 stage.frame(maxWidth: .infinity, maxHeight: .infinity)
                 sidebar.frame(width: 315)
             }
             .padding(20)
-            Divider().overlay(rule)
+            Divider().overlay(palette.rule)
             footer
         }
-        .background(canvas)
-        .preferredColorScheme(.dark)
-        .tint(accent)
-        .sheet(isPresented: $workspace.settings) { SetupView(workspace: workspace) }
-        .sheet(isPresented: $ui.showHistory) { HistoryView(workspace: workspace) }
+        .background(palette.canvas)
+        .tint(palette.accent)
+        .sheet(isPresented: $workspace.settings) {
+            SetupView(workspace: workspace, appearance: $appearance)
+                .preferredColorScheme(appearance.colorScheme)
+        }
+        .sheet(isPresented: $ui.showHistory) {
+            HistoryView(workspace: workspace)
+                .preferredColorScheme(appearance.colorScheme)
+        }
         .sheet(item: $ui.editing) { cut in
             VStack(alignment: .leading, spacing: 16) {
                 Text("调整切点").font(.title2.weight(.semibold))
@@ -60,6 +112,7 @@ struct Editor: View {
                 }
             }
             .padding(24).frame(width: 330)
+            .preferredColorScheme(appearance.colorScheme)
         }
         .alert("处理遇到问题", isPresented: Binding(get: { workspace.error != nil }, set: { value in
             if !value { workspace.error = nil }
@@ -69,17 +122,18 @@ struct Editor: View {
         .onChange(of: workspace.busy) { _, busy in
             if busy { ui.marking = false; ui.drag = nil }
         }
+        .preferredColorScheme(appearance.colorScheme)
     }
 
     private var header: some View {
         HStack(spacing: 14) {
             Label("VideoCut++", systemImage: "film.stack")
                 .font(.system(size: 20, weight: .bold))
-                .foregroundStyle(accent)
+                .foregroundStyle(palette.accent)
             TextField("粘贴 B 站、YouTube 或抖音视频链接", text: $workspace.link)
                 .textFieldStyle(.plain)
                 .padding(.horizontal, 12).padding(.vertical, 9)
-                .background(panel, in: RoundedRectangle(cornerRadius: 8))
+                .background(palette.panel, in: RoundedRectangle(cornerRadius: 8))
                 .onSubmit { if !workspace.busy && !workspace.link.isEmpty { workspace.download() } }
                 .accessibilityLabel("视频链接")
             Button("下载并准备剪辑") { workspace.download() }
@@ -111,7 +165,7 @@ struct Editor: View {
                 }
             }
             ZStack {
-                RoundedRectangle(cornerRadius: 12).fill(.black.opacity(0.38))
+                RoundedRectangle(cornerRadius: 12).fill(workspace.playable == nil ? palette.emptyPreview : .black)
                 if workspace.playable != nil {
                     PlayerSurface(player: workspace.player)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -135,8 +189,8 @@ struct Editor: View {
                                     ui.drag = nil
                                     ui.marking = false
                                 })
-                            RoundedRectangle(cornerRadius: 2).fill(accent.opacity(0.13))
-                                .overlay(RoundedRectangle(cornerRadius: 2).stroke(accent, lineWidth: 2))
+                            RoundedRectangle(cornerRadius: 2).fill(Palette.selection.opacity(0.13))
+                                .overlay(RoundedRectangle(cornerRadius: 2).stroke(Palette.selection, lineWidth: 2))
                                 .frame(width: rect.width, height: rect.height)
                                 .position(x: rect.midX, y: rect.midY)
                                 .allowsHitTesting(false)
@@ -145,13 +199,13 @@ struct Editor: View {
                 } else {
                     VStack(spacing: 13) {
                         Image(systemName: "play.rectangle").font(.system(size: 42, weight: .ultraLight))
-                            .foregroundStyle(accent.opacity(0.75))
+                            .foregroundStyle(palette.accent.opacity(0.75))
                         Text("粘贴链接或打开本地视频").font(.headline).foregroundStyle(.secondary)
                     }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(rule))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(palette.rule))
             if workspace.playable != nil {
                 VStack(spacing: 6) {
                     Slider(value: Binding(get: { min(workspace.currentTime, workspace.duration) },
@@ -176,7 +230,7 @@ struct Editor: View {
                         Text("分段").font(.headline)
                         Spacer()
                         if workspace.playable != nil {
-                            Text("\(workspace.cuts.count + 1) 段").font(.caption.monospacedDigit()).foregroundStyle(accent)
+                            Text("\(workspace.cuts.count + 1) 段").font(.caption.monospacedDigit()).foregroundStyle(palette.accent)
                         }
                     }
                     HStack {
@@ -197,7 +251,7 @@ struct Editor: View {
                             Button { workspace.preview(cut) } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(timestamp(cut.seconds)).font(.system(.subheadline, design: .monospaced))
-                                        .foregroundStyle(accent)
+                                        .foregroundStyle(palette.accent)
                                     Text(cut.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -217,7 +271,7 @@ struct Editor: View {
                             .buttonStyle(.borderless).help("移除切点").accessibilityLabel("移除切点 \(index + 1)")
                             .padding([.top, .trailing], 9)
                         }
-                        .background(canvas, in: RoundedRectangle(cornerRadius: 8))
+                        .background(palette.canvas, in: RoundedRectangle(cornerRadius: 8))
                         .disabled(workspace.busy || ui.marking)
                     }
                 }.modifier(Card())
@@ -236,7 +290,7 @@ struct Editor: View {
                         }
                     }.disabled(workspace.playable == nil || workspace.busy)
                     if ui.marking {
-                        Text("在画面中拖动，框住完整水印。").font(.caption).foregroundStyle(accent)
+                        Text("在画面中拖动，框住完整水印。").font(.caption).foregroundStyle(palette.accent)
                     }
                     if !workspace.seeds.isEmpty {
                         HStack {
@@ -345,10 +399,13 @@ private func selectFolder(_ prompt: String, initial: URL? = nil) -> URL? {
 }
 
 private struct Card: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+
     func body(content: Content) -> some View {
+        let palette = Palette(colorScheme)
         content.padding(14).frame(maxWidth: .infinity, alignment: .leading)
-            .background(panel, in: RoundedRectangle(cornerRadius: 11))
-            .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(rule))
+            .background(palette.panel, in: RoundedRectangle(cornerRadius: 11))
+            .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(palette.rule))
     }
 }
 
@@ -362,12 +419,16 @@ private struct PlayerSurface: NSViewRepresentable {
         view.showsFullScreenToggleButton = false
         return view
     }
-    func updateNSView(_ view: AVPlayerView, context: Context) {}
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        view.appearance = NSAppearance(named: context.environment.colorScheme == .dark ? .darkAqua : .aqua)
+    }
 }
 
 private struct HistoryView: View {
     @ObservedObject var workspace: Workspace
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+    private var palette: Palette { Palette(colorScheme) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -385,7 +446,7 @@ private struct HistoryView: View {
                     .disabled(workspace.busy)
             }
             if let error = workspace.historyError {
-                Text(error).font(.caption).foregroundStyle(.orange)
+                Text(error).font(.caption).foregroundStyle(palette.warning)
             }
             if workspace.history.isEmpty {
                 Text("暂无处理记录。可导入以前导出的 MP4 分段文件夹。")
@@ -401,7 +462,8 @@ private struct HistoryView: View {
         }
         .padding(23)
         .frame(width: 730, height: 450)
-        .background(canvas)
+        .background(palette.canvas)
+        .tint(palette.accent)
         .task { await workspace.refreshHistory() }
         .alert("删除历史记录？", isPresented: Binding(
             get: { workspace.pendingHistoryDeletion != nil },
@@ -467,7 +529,10 @@ private struct HistoryView: View {
 
 private struct SetupView: View {
     @ObservedObject var workspace: Workspace
+    @Binding var appearance: AppearanceMode
     @StateObject private var ui = SettingsState()
+    @Environment(\.colorScheme) private var colorScheme
+    private var palette: Palette { Palette(colorScheme) }
 
     var body: some View {
         ScrollView {
@@ -476,7 +541,9 @@ private struct SetupView: View {
         }
         .frame(width: 525)
         .frame(maxHeight: 640)
-        .background(canvas).onAppear(perform: read)
+        .background(palette.canvas)
+        .tint(palette.accent)
+        .onAppear(perform: read)
         .onChange(of: workspace.provider) { _, _ in read() }
         .alert("清理下载内容？", isPresented: $ui.confirmCleanup) {
             Button("取消", role: .cancel) {}
@@ -493,6 +560,13 @@ private struct SetupView: View {
                 Spacer()
                 Button("完成") { workspace.settings = false }.keyboardShortcut(.defaultAction)
             }
+            Picker("界面外观", selection: $appearance) {
+                ForEach(AppearanceMode.allCases, id: \.self) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .modifier(Card())
             storageSettings
             VStack(alignment: .leading, spacing: 10) {
                 Text("AI 服务").font(.headline)
@@ -511,7 +585,7 @@ private struct SetupView: View {
                 Text("仅将带时间戳的本地转写和缩略图发送到所选服务。Key 存于 macOS 钥匙串。")
                     .font(.caption).foregroundStyle(.secondary)
                 if !ui.note.isEmpty {
-                    Text(ui.note).font(.caption).foregroundStyle(accent).textSelection(.enabled)
+                    Text(ui.note).font(.caption).foregroundStyle(palette.accent).textSelection(.enabled)
                 }
             }.modifier(Card()).disabled(workspace.busy || ui.testing)
             VStack(alignment: .leading, spacing: 9) {
@@ -540,7 +614,7 @@ private struct SetupView: View {
                 }.disabled(workspace.busy)
             }.modifier(Card())
             if let error = workspace.error {
-                Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                Text(error).font(.caption).foregroundStyle(palette.warning).textSelection(.enabled)
             }
         }
     }

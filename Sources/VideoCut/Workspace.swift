@@ -4,7 +4,18 @@ import Foundation
 
 @MainActor
 final class Workspace: ObservableObject {
+    static let jobsRoot = Tools.support.appendingPathComponent("Jobs", isDirectory: true)
+    private static let downloadFolderKey = "downloadFolder"
+    private static let exportFolderKey = "exportFolder"
+    private static let downloadJobsKey = "downloadJobs"
+
     @Published var link = ""
+    @Published var downloadFolder = UserDefaults.standard.url(forKey: Workspace.downloadFolderKey) {
+        didSet { UserDefaults.standard.set(downloadFolder, forKey: Self.downloadFolderKey) }
+    }
+    @Published var exportFolder = UserDefaults.standard.url(forKey: Workspace.exportFolderKey) {
+        didSet { UserDefaults.standard.set(exportFolder, forKey: Self.exportFolderKey) }
+    }
     @Published var provider = Provider(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") ?? .openAI {
         didSet { UserDefaults.standard.set(provider.rawValue, forKey: "provider") }
     }
@@ -18,6 +29,7 @@ final class Workspace: ObservableObject {
     @Published private(set) var busy = false
     @Published private(set) var activity = ""
     @Published private(set) var status = "粘贴链接或打开本地视频"
+    @Published private(set) var cleanupStatus: String?
     @Published private(set) var currentTime = 0.0
     @Published private(set) var result: URL?
     @Published var error: String?
@@ -34,19 +46,20 @@ final class Workspace: ObservableObject {
     let player = AVPlayer()
 
     private var workspace: URL?
-    private var lastDownload: (link: URL, directory: URL)?
+    private var lastDownload: (link: URL, directory: URL, work: URL)?
     private var cookieFile: URL?
     private var task: Task<Void, Never>?
     private var operationID: UUID?
     private var observer: Any?
+    private var pendingSeek: UUID?
 
     init() {
         observer = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.12, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
             Task { @MainActor in
-                guard time.seconds.isFinite else { return }
-                self?.currentTime = time.seconds
+                guard let self, self.playable != nil, self.pendingSeek == nil, time.seconds.isFinite else { return }
+                self.currentTime = time.seconds
             }
         }
     }
@@ -58,6 +71,7 @@ final class Workspace: ObservableObject {
 
     var hasCookies: Bool { cookieFile != nil }
     var duration: Double { info?.duration ?? 0 }
+    var downloadRoot: URL { downloadFolder ?? Self.jobsRoot }
 
     func model(for provider: Provider) -> String {
         UserDefaults.standard.string(forKey: "model.\(provider.rawValue)") ?? provider.defaultModel
@@ -72,13 +86,33 @@ final class Workspace: ObservableObject {
     func download() {
         launch("下载视频") { id in
             let url = try SourceLink.parse(self.link)
+            let root = self.downloadRoot.standardizedFileURL
             let directory: URL
-            if let last = self.lastDownload, last.link == url {
+            let work: URL
+            if let last = self.lastDownload, last.link == url,
+               last.directory.deletingLastPathComponent().standardizedFileURL.path == root.path {
                 directory = last.directory
+                work = last.work
             } else {
-                directory = try self.makeDirectory()
-                self.lastDownload = (url, directory)
+                let jobID = UUID().uuidString
+                directory = root.appendingPathComponent(jobID, isDirectory: true)
+                work = Self.jobsRoot.appendingPathComponent(jobID, isDirectory: true)
+                self.lastDownload = (url, directory, work)
             }
+            if self.downloadFolder != nil {
+                var isDirectory: ObjCBool = false
+                guard Tools.files.fileExists(atPath: root.path, isDirectory: &isDirectory),
+                      isDirectory.boolValue else {
+                    throw AppError("下载目录不可用，请在设置中重新选择。")
+                }
+            }
+            try Tools.files.createDirectory(at: directory, withIntermediateDirectories: true)
+            if work != directory {
+                try Tools.files.createDirectory(at: work, withIntermediateDirectories: true)
+            }
+            var registered = self.downloadJobs
+            registered[directory.lastPathComponent] = DownloadCleanup.canonicalPath(root) ?? root.path
+            self.downloadJobs = registered
             let host = url.host?.lowercased() ?? ""
             let useCookies = host == "douyin.com" || host.hasSuffix(".douyin.com")
             let source = try await Media.download(
@@ -86,7 +120,7 @@ final class Workspace: ObservableObject {
                 progress: self.progress(id)
             )
             self.activity = "载入视频"
-            try await self.load(source, directory: directory)
+            try await self.load(source, directory: work)
             var needsKey = false
             if self.duration <= 60 {
                 self.keepShortVideo()
@@ -112,6 +146,44 @@ final class Workspace: ObservableObject {
     func useDouyinCookies(_ url: URL?) {
         cookieFile = url
         objectWillChange.send()
+    }
+
+    func clearDownloads() {
+        launch("清理下载") { _ in
+            self.cleanupStatus = nil
+            var registered = self.downloadJobs
+            let jobs = await DownloadCleanup.jobs(in: Self.jobsRoot, currentRoot: self.downloadRoot, registered: registered)
+            try Task.checkCancellation()
+            guard !jobs.isEmpty else {
+                self.cleanupStatus = "目前没有可清理的下载文件。"
+                return
+            }
+
+            for job in jobs { registered[job.id] = job.root.path }
+            self.downloadJobs = registered
+            let paths = Set(jobs.flatMap(\.files).map(\.path))
+            if [self.original, self.playable, self.repaired].compactMap({ $0 })
+                .compactMap(DownloadCleanup.canonicalPath).contains(where: paths.contains) {
+                self.closePreview()
+            }
+            if let last = self.lastDownload, jobs.contains(where: { $0.id == last.directory.lastPathComponent }) {
+                self.lastDownload = nil
+            }
+            let outcome = await DownloadCleanup.remove(jobs)
+            for id in outcome.completed { registered.removeValue(forKey: id) }
+            self.downloadJobs = registered
+            let remaining = jobs.count - outcome.completed.count - outcome.failed
+            var message = "已清理 \(outcome.completed.count) 个下载任务。"
+            if outcome.failed > 0 { message += "\(outcome.failed) 个任务未清理完成，可重试。" }
+            if remaining > 0 { message += "已停止，剩余 \(remaining) 个任务。" }
+            self.cleanupStatus = message
+            self.status = message
+        }
+    }
+
+    private var downloadJobs: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: Self.downloadJobsKey) as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: Self.downloadJobsKey) }
     }
 
     func analyze() {
@@ -159,9 +231,23 @@ final class Workspace: ObservableObject {
 
     func seek(to value: Double) {
         let time = min(max(0, value), duration)
+        let request = UUID()
+        pendingSeek = request
         currentTime = time
         player.seek(to: CMTime(seconds: time, preferredTimescale: 60_000),
-                    toleranceBefore: .zero, toleranceAfter: .zero)
+                    toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor in
+                guard let self, self.pendingSeek == request else { return }
+                self.pendingSeek = nil
+                let actual = self.player.currentTime().seconds
+                if !finished, actual.isFinite { self.currentTime = actual }
+            }
+        }
+    }
+
+    func preview(_ cut: Cut) {
+        player.pause()
+        seek(to: cut.seconds)
     }
 
     func addCut() {
@@ -177,8 +263,9 @@ final class Workspace: ObservableObject {
               let position = cuts.firstIndex(where: { $0.id == id }) else { return }
         cuts[position].seconds = value
         cuts[position].reason = "手动调整"
+        let cut = cuts[position]
         cuts.sort { $0.seconds < $1.seconds }
-        seek(to: value)
+        preview(cut)
     }
 
     func addSeed(_ rect: CGRect) {
@@ -264,7 +351,7 @@ final class Workspace: ObservableObject {
     }
 
     private func makeDirectory() throws -> URL {
-        let directory = Tools.support.appendingPathComponent("Jobs/\(UUID().uuidString)", isDirectory: true)
+        let directory = Self.jobsRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try Tools.files.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
@@ -272,6 +359,24 @@ final class Workspace: ObservableObject {
     private func show(_ url: URL?, at time: Double) {
         player.replaceCurrentItem(with: url.map { AVPlayerItem(url: $0) })
         seek(to: time)
+    }
+
+    private func closePreview() {
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        pendingSeek = nil
+        original = nil
+        playable = nil
+        repaired = nil
+        info = nil
+        workspace = nil
+        compareOriginal = false
+        currentTime = 0
+        cuts.removeAll()
+        seeds.removeAll()
+        maskNeedsUpdate = false
+        analyzed = false
+        report = nil
     }
 
     private func progress(_ id: UUID) -> @Sendable (String) -> Void {

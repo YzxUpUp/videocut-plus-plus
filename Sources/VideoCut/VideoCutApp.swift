@@ -189,24 +189,29 @@ struct Editor: View {
                     }
                     ForEach(Array(workspace.cuts.enumerated()), id: \.element.id) { index, cut in
                         HStack(alignment: .top, spacing: 8) {
-                            Button { workspace.seek(to: cut.seconds) } label: {
+                            Button { workspace.preview(cut) } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(timestamp(cut.seconds)).font(.system(.subheadline, design: .monospaced))
                                         .foregroundStyle(accent)
                                     Text(cut.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                                }.frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(9)
+                                .contentShape(Rectangle())
                             }.buttonStyle(.plain)
+                            .help("跳转到 \(timestamp(cut.seconds)) 并暂停预览")
                             Button {
                                 ui.seconds = String(format: "%.3f", cut.seconds)
                                 ui.editing = cut
                             } label: { Image(systemName: "pencil") }
                             .buttonStyle(.borderless).help("调整切点").accessibilityLabel("调整切点 \(index + 1)")
+                            .padding(.top, 9)
                             Button {
                                 workspace.cuts.removeAll { $0.id == cut.id }
                             } label: { Image(systemName: "minus.circle") }
                             .buttonStyle(.borderless).help("移除切点").accessibilityLabel("移除切点 \(index + 1)")
+                            .padding([.top, .trailing], 9)
                         }
-                        .padding(9)
                         .background(canvas, in: RoundedRectangle(cornerRadius: 8))
                         .disabled(workspace.busy || ui.marking)
                     }
@@ -304,12 +309,9 @@ struct Editor: View {
     }
 
     private func chooseExportFolder() {
-        let open = NSOpenPanel()
-        open.canChooseFiles = false
-        open.canChooseDirectories = true
-        open.canCreateDirectories = true
-        open.prompt = "导出到此文件夹"
-        if open.runModal() == .OK, let url = open.url { workspace.export(to: url) }
+        if let url = workspace.exportFolder ?? selectFolder("导出到此文件夹") {
+            workspace.export(to: url)
+        }
     }
 
     private func videoBounds(in size: CGSize) -> CGRect {
@@ -324,6 +326,17 @@ struct Editor: View {
     private func clamp(_ point: CGPoint, to rect: CGRect) -> CGPoint {
         CGPoint(x: min(rect.maxX, max(rect.minX, point.x)), y: min(rect.maxY, max(rect.minY, point.y)))
     }
+}
+
+@MainActor
+private func selectFolder(_ prompt: String, initial: URL? = nil) -> URL? {
+    let open = NSOpenPanel()
+    open.canChooseFiles = false
+    open.canChooseDirectories = true
+    open.canCreateDirectories = true
+    open.directoryURL = initial
+    open.prompt = prompt
+    return open.runModal() == .OK ? open.url : nil
 }
 
 private struct Card: ViewModifier {
@@ -352,12 +365,30 @@ private struct SetupView: View {
     @StateObject private var ui = SettingsState()
 
     var body: some View {
+        ScrollView {
+            settingsContent
+                .padding(23)
+        }
+        .frame(width: 525)
+        .frame(maxHeight: 640)
+        .background(canvas).onAppear(perform: read)
+        .onChange(of: workspace.provider) { _, _ in read() }
+        .alert("清理下载内容？", isPresented: $ui.confirmCleanup) {
+            Button("取消", role: .cancel) {}
+            Button("永久清理", role: .destructive) { workspace.clearDownloads() }
+        } message: {
+            Text("将永久删除应用下载的原片和相关处理文件。清理后无法复原。已导出的 MP4 会保留。")
+        }
+    }
+
+    private var settingsContent: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 Text("设置").font(.title2.bold())
                 Spacer()
                 Button("完成") { workspace.settings = false }.keyboardShortcut(.defaultAction)
             }
+            storageSettings
             VStack(alignment: .leading, spacing: 10) {
                 Text("AI 服务").font(.headline)
                 Picker("服务商", selection: $workspace.provider) {
@@ -407,9 +438,48 @@ private struct SetupView: View {
                 Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
             }
         }
-        .padding(23).frame(width: 525)
-        .background(canvas).onAppear(perform: read)
-        .onChange(of: workspace.provider) { _, _ in read() }
+    }
+
+    private var storageSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("存储位置").font(.headline)
+            folderSetting("下载目录", value: $workspace.downloadFolder,
+                          fallback: Workspace.jobsRoot.path, resetLabel: "恢复默认")
+            Divider()
+            folderSetting("MP4 导出目录", value: $workspace.exportFolder,
+                          fallback: "每次导出时询问", resetLabel: "改为每次询问")
+            Divider()
+            HStack {
+                Button("清理下载内容…", role: .destructive) { ui.confirmCleanup = true }
+                if let status = workspace.cleanupStatus {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .modifier(Card())
+        .disabled(workspace.busy)
+    }
+
+    private func folderSetting(_ title: String, value: Binding<URL?>, fallback: String, resetLabel: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(title).font(.subheadline)
+                Spacer()
+                Button("选择…") {
+                    if let url = selectFolder("使用此文件夹", initial: value.wrappedValue) {
+                        value.wrappedValue = url
+                    }
+                }
+                .accessibilityLabel("选择\(title)")
+                if value.wrappedValue != nil {
+                    Button(resetLabel) { value.wrappedValue = nil }
+                }
+            }
+            Text(value.wrappedValue?.path ?? fallback)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        }
     }
 
     private func read() {
@@ -455,6 +525,7 @@ private final class EditorState: ObservableObject {
 }
 
 private final class SettingsState: ObservableObject {
+    @Published var confirmCleanup = false
     @Published var model = ""
     @Published var key = ""
     @Published var keyOnFile = false

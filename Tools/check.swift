@@ -8,6 +8,8 @@ enum LocalChecks {
         testRefinesNearSpeechEndAndRejectsMidSentence()
         try testParsesProviderResponseEnvelopes()
         print("链接、切点和两家 API 响应解析检查通过")
+        try await checkDownloadCleanup()
+        print("下载清理、导出保留和目录边界检查通过")
         if let link = ProcessInfo.processInfo.environment["VIDEOCUT_TEST_LINK"] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -64,6 +66,55 @@ enum LocalChecks {
         }
         throwsError(try AIClient.decodeCuts("invalid"))
         equal(try AIClient.decodeCuts(#"{"cuts":[]}"#), [])
+    }
+
+    private static func checkDownloadCleanup() async throws {
+        let fm = FileManager.default
+        let scratch = fm.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: scratch) }
+        let jobs = scratch.appendingPathComponent("Jobs", isDirectory: true)
+        let current = scratch.appendingPathComponent("当前下载目录", isDirectory: true)
+        let previous = scratch.appendingPathComponent("之前的下载目录", isDirectory: true)
+        let defaultID = UUID().uuidString
+        let legacyID = UUID().uuidString
+        let trackedID = UUID().uuidString
+        let importID = UUID().uuidString
+        let previousJob = previous.appendingPathComponent(trackedID, isDirectory: true)
+        let legacyJob = current.appendingPathComponent(legacyID, isDirectory: true)
+        let filesToClean = [
+            jobs.appendingPathComponent("\(defaultID)/source.mp4"),
+            jobs.appendingPathComponent("\(defaultID)/samples/000001.jpg"),
+            jobs.appendingPathComponent("\(legacyID)/repair-\(UUID().uuidString).mp4"),
+            legacyJob.appendingPathComponent("source.mkv"),
+            previousJob.appendingPathComponent("source.f247.webm.part-Frag1")
+        ]
+        let keepFiles = [
+            scratch.appendingPathComponent("outside.mp4"),
+            jobs.appendingPathComponent("\(defaultID)/已导出/01.mp4"),
+            jobs.appendingPathComponent("\(importID)/preview-\(UUID().uuidString).mp4"),
+            current.appendingPathComponent("\(UUID().uuidString)/source.mp4"),
+            legacyJob.appendingPathComponent("source.txt"),
+            previousJob.appendingPathComponent("导出/01.mp4")
+        ]
+        for file in filesToClean + keepFiles {
+            try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("fixture".utf8).write(to: file)
+        }
+        let symlink = legacyJob.appendingPathComponent("source.mp4")
+        try fm.createSymbolicLink(at: symlink, withDestinationURL: keepFiles[0])
+
+        let registered = [trackedID: try unwrap(DownloadCleanup.canonicalPath(previous))]
+        let plan = await DownloadCleanup.jobs(in: jobs, currentRoot: current, registered: registered)
+        equal(Set(plan.map(\.id)), Set([defaultID, legacyID, trackedID]))
+        equal(Set(plan.flatMap(\.files).map(\.path)), Set(filesToClean.compactMap(DownloadCleanup.canonicalPath)))
+        let result = await DownloadCleanup.remove(plan)
+        equal(result.failed, 0)
+        equal(Set(result.completed), Set([defaultID, legacyID, trackedID]))
+        equal(filesToClean.filter { fm.fileExists(atPath: $0.path) }.map(\.path), [])
+        check((keepFiles + [symlink]).allSatisfy { fm.fileExists(atPath: $0.path) })
+        let repeated = await DownloadCleanup.jobs(in: jobs, currentRoot: current, registered: [:])
+        check(repeated.isEmpty)
     }
 
     private static func checkVisionRequests(info: MediaInfo, frames: [FrameSample],

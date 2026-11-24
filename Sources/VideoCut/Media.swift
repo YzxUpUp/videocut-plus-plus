@@ -13,8 +13,8 @@ struct MaskSeed: Codable {
     let height: Double
 }
 
-struct WatermarkReport: Decodable {
-    struct Interval: Decodable, Identifiable {
+struct WatermarkReport: Codable {
+    struct Interval: Codable, Identifiable {
         let start: Double
         let end: Double
         var id: Double { start }
@@ -205,6 +205,135 @@ enum Media {
         let video = directory.appendingPathComponent("repair-\(id).mp4")
         try Tools.files.moveItem(at: draft, to: video)
         return (video, report)
+    }
+
+    static func collectionClips(in folder: URL) throws -> [URL] {
+        let files = try Tools.files.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey],
+                                                       options: .skipsHiddenFiles)
+        let clips = try files.filter {
+            guard $0.pathExtension.lowercased() == "mp4" else { return false }
+            return try $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true
+        }.sorted {
+            let order = $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent)
+            return order == .orderedSame ? $0.lastPathComponent < $1.lastPathComponent : order == .orderedAscending
+        }
+        guard !clips.isEmpty else { throw AppError("这个文件夹中没有可导入的 MP4。请选择包含分段文件的文件夹。") }
+        return clips
+    }
+
+    struct Collection {
+        let source: URL
+        let cuts: [Cut]
+        let count: Int
+    }
+
+    private struct CollectionProbe: Decodable {
+        struct Stream: Decodable, Equatable {
+            struct SideData: Decodable, Equatable { let rotation: Int? }
+            let codec_name: String?
+            let codec_type: String
+            let width: Int?
+            let height: Int?
+            let pix_fmt: String?
+            let r_frame_rate: String?
+            let sample_aspect_ratio: String?
+            let sample_rate: String?
+            let channels: Int?
+            let channel_layout: String?
+            let time_base: String?
+            let extradata_hash: String?
+            let side_data_list: [SideData]?
+        }
+        struct Format: Decodable { let duration: String? }
+        let streams: [Stream]
+        let format: Format
+    }
+
+    static func importCollection(_ folder: URL, in directory: URL,
+                                 progress: @escaping @Sendable (String) -> Void) async throws -> Collection {
+        let clips = try collectionClips(in: folder)
+        var probes: [CollectionProbe] = []
+        var lengths: [Double] = []
+        for clip in clips {
+            let json = try await Tools.run("ffprobe", [
+                "-v", "error", "-show_data_hash", "sha256", "-show_entries",
+                "stream=codec_name,codec_type,width,height,pix_fmt,r_frame_rate,sample_aspect_ratio,sample_rate,channels,channel_layout,time_base,extradata_hash:stream_side_data=rotation:format=duration",
+                "-of", "json", clip.path
+            ], in: directory)
+            let probe = try JSONDecoder().decode(CollectionProbe.self, from: Data(json.utf8))
+            guard probe.streams.contains(where: { $0.codec_type == "video" }),
+                  let length = probe.format.duration.flatMap(Double.init), length.isFinite, length > 0 else {
+                throw AppError("\(clip.lastPathComponent) 没有可读取的视频轨或时长。")
+            }
+            probes.append(probe)
+            lengths.append(length)
+        }
+        let result = directory.appendingPathComponent("collection.mp4")
+        guard let firstStreams = probes.first?.streams,
+              let firstVideo = firstStreams.first(where: { $0.codec_type == "video" }) else {
+            throw AppError("合集没有可读取的视频轨。")
+        }
+        let audio = probes.map { $0.streams.contains { $0.codec_type == "audio" } }
+        let compatible = firstVideo.codec_name == "h264" &&
+            firstStreams.filter { $0.codec_type == "video" }.count == 1 &&
+            firstStreams.filter { $0.codec_type == "audio" }.count <= 1 &&
+            firstStreams.allSatisfy {
+                ["h264", "aac"].contains($0.codec_name ?? "") && $0.extradata_hash != nil &&
+                    ($0.side_data_list ?? []).allSatisfy { ($0.rotation ?? 0) == 0 }
+            } && probes.allSatisfy { $0.streams == firstStreams }
+        if compatible {
+            let manifest = directory.appendingPathComponent("collection.ffconcat")
+            var aliases: [URL] = []
+            defer {
+                for alias in aliases { try? Tools.files.removeItem(at: alias) }
+                try? Tools.files.removeItem(at: manifest)
+            }
+            var lines = ["ffconcat version 1.0"]
+            for (index, clip) in clips.enumerated() {
+                let alias = directory.appendingPathComponent("part-\(index).mp4")
+                try Tools.files.createSymbolicLink(at: alias, withDestinationURL: clip)
+                aliases.append(alias)
+                lines.append("file \(alias.lastPathComponent)")
+                lines.append("duration \(number(lengths[index]))")
+            }
+            try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: manifest)
+            _ = try await Tools.run("ffmpeg", base + [
+                "-f", "concat", "-i", manifest.path, "-map", "0:V:0", "-map", "0:a:0?",
+                "-c", "copy", "-movflags", "+faststart", result.path
+            ], in: directory, progress: progress)
+        } else {
+            let hasAudio = audio.contains(true)
+            lengths = lengths.map { ceil($0 * 30) / 30 }
+            let rotated = (firstVideo.side_data_list?.first?.rotation ?? 0) % 180 != 0
+            let aspect = (firstVideo.sample_aspect_ratio ?? "").split(separator: ":").compactMap { Double($0) }
+            let pixelRatio = aspect.count == 2 && aspect[0] > 0 && aspect[1] > 0 ? aspect[0] / aspect[1] : 1
+            let displayWidth = Int(max(2, min(8192, Double(firstVideo.width ?? 1920) * pixelRatio)))
+            let displayHeight = max(2, firstVideo.height ?? 1080)
+            let width = (rotated ? displayHeight : displayWidth) / 2 * 2
+            let height = (rotated ? displayWidth : displayHeight) / 2 * 2
+            let filters = clips.indices.flatMap { i -> [String] in
+                let duration = number(lengths[i])
+                let video = "[\(i):V:0]scale=\(width):\(height):force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,pad=\(width):\(height):(ow-iw)/2:(oh-ih)/2,fps=30,tpad=stop_mode=clone:stop_duration=\(duration),trim=duration=\(duration),format=yuv420p,setpts=PTS-STARTPTS[v\(i)]"
+                guard hasAudio else { return [video] }
+                let source = audio[i] ? "[\(i):a:0]aresample=48000,aformat=channel_layouts=stereo,apad"
+                    : "anullsrc=r=48000:cl=stereo"
+                return [video, source + ",atrim=duration=\(duration),asetpts=PTS-STARTPTS[a\(i)]"]
+            }
+            let inputs = clips.indices.map { hasAudio ? "[v\($0)][a\($0)]" : "[v\($0)]" }.joined()
+            let graph = (filters + ["\(inputs)concat=n=\(clips.count):v=1:a=\(hasAudio ? 1 : 0)[v]" + (hasAudio ? "[a]" : "")])
+                .joined(separator: ";")
+            var options = clips.flatMap { ["-i", $0.path] } + ["-filter_complex", graph, "-map", "[v]"]
+            if hasAudio { options += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"] }
+            options += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-movflags", "+faststart", result.path]
+            progress("统一分段的视频格式")
+            _ = try await Tools.run("ffmpeg", base + options, in: directory)
+        }
+        var offset = 0.0
+        let cuts = lengths.dropLast().enumerated().map { i, length in
+            offset += length
+            return Cut(offset, "原合集分段 · \(clips[i + 1].lastPathComponent)")
+        }
+        return Collection(source: result, cuts: cuts, count: clips.count)
     }
 
     static func export(_ source: URL, info: MediaInfo, cuts: [Cut], destination: URL, title: String,

@@ -41,6 +41,7 @@ struct Editor: View {
         .preferredColorScheme(.dark)
         .tint(accent)
         .sheet(isPresented: $workspace.settings) { SetupView(workspace: workspace) }
+        .sheet(isPresented: $ui.showHistory) { HistoryView(workspace: workspace) }
         .sheet(item: $ui.editing) { cut in
             VStack(alignment: .leading, spacing: 16) {
                 Text("调整切点").font(.title2.weight(.semibold))
@@ -86,6 +87,10 @@ struct Editor: View {
                 .disabled(workspace.busy || workspace.link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Button { chooseFile() } label: { Label("打开文件", systemImage: "folder") }
                 .disabled(workspace.busy)
+            Button { ui.showHistory = true } label: {
+                Label("历史", systemImage: "clock.arrow.circlepath")
+            }
+            .disabled(workspace.busy)
             Button { workspace.settings = true } label: {
                 Image(systemName: "gearshape").font(.system(size: 16)).padding(4)
             }.help("设置").accessibilityLabel("设置")
@@ -97,7 +102,7 @@ struct Editor: View {
     private var stage: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(workspace.original?.lastPathComponent ?? "视频预览")
+                Text(workspace.videoTitle ?? "视频预览")
                     .font(.headline).lineLimit(1)
                 Spacer()
                 if workspace.repaired != nil {
@@ -207,7 +212,7 @@ struct Editor: View {
                             .buttonStyle(.borderless).help("调整切点").accessibilityLabel("调整切点 \(index + 1)")
                             .padding(.top, 9)
                             Button {
-                                workspace.cuts.removeAll { $0.id == cut.id }
+                                workspace.removeCut(cut.id)
                             } label: { Image(systemName: "minus.circle") }
                             .buttonStyle(.borderless).help("移除切点").accessibilityLabel("移除切点 \(index + 1)")
                             .padding([.top, .trailing], 9)
@@ -358,6 +363,106 @@ private struct PlayerSurface: NSViewRepresentable {
         return view
     }
     func updateNSView(_ view: AVPlayerView, context: Context) {}
+}
+
+private struct HistoryView: View {
+    @ObservedObject var workspace: Workspace
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("处理历史").font(.title2.bold())
+                Spacer()
+                Button {
+                    if let folder = selectFolder("导入此合集", initial: workspace.exportFolder) {
+                        importFolder(folder)
+                    }
+                } label: { Label("导入合集…", systemImage: "folder.badge.plus") }
+                .buttonStyle(.borderedProminent)
+                .disabled(workspace.busy)
+                Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .disabled(workspace.busy)
+            }
+            if let error = workspace.historyError {
+                Text(error).font(.caption).foregroundStyle(.orange)
+            }
+            if workspace.history.isEmpty {
+                Text("暂无处理记录。可导入以前导出的 MP4 分段文件夹。")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 9) {
+                        ForEach(workspace.history) { entry in historyRow(entry) }
+                    }
+                }
+            }
+        }
+        .padding(23)
+        .frame(width: 730, height: 450)
+        .background(canvas)
+        .task { await workspace.refreshHistory() }
+        .alert("删除历史记录？", isPresented: Binding(
+            get: { workspace.pendingHistoryDeletion != nil },
+            set: { if !$0 { workspace.dismissHistoryDeletion() } }
+        ), presenting: workspace.pendingHistoryDeletion) { plan in
+            Button("取消", role: .cancel) { workspace.dismissHistoryDeletion() }
+            Button("永久删除", role: .destructive) { workspace.deleteHistory(plan) }
+        } message: { plan in
+            Text(plan.message)
+        }
+    }
+
+    private func historyRow(_ entry: HistoryEntry) -> some View {
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(entry.title).font(.headline).lineLimit(1)
+                HStack(spacing: 8) {
+                    Text(entry.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                    if entry.original != nil && !entry.canOpen { Text("原片不可用") }
+                    if !entry.exports.isEmpty { Text("\(entry.exports.count) 次导出") }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if entry.original != nil {
+                if !entry.canOpen, let link = entry.sourceLink {
+                    Button("使用原链接") {
+                        workspace.link = link.absoluteString
+                        dismiss()
+                    }
+                } else {
+                    Button("打开任务") {
+                        dismiss()
+                        workspace.restore(entry)
+                    }
+                    .disabled(!entry.canOpen)
+                }
+            }
+            let folders = (entry.exports.reversed() + [entry.collection].compactMap { $0 })
+                .filter { Tools.files.fileExists(atPath: $0.path) }
+            if folders.count == 1, let folder = folders.first {
+                Button("重新处理合集") { importFolder(folder) }
+            } else if folders.count > 1 {
+                Menu("重新处理合集") {
+                    ForEach(folders, id: \.self) { folder in
+                        Button(folder.lastPathComponent) { importFolder(folder) }
+                    }
+                }
+                .fixedSize()
+            }
+            Button("删除…", role: .destructive) { workspace.prepareHistoryDeletion(entry) }
+                .accessibilityLabel("删除\(entry.title)")
+        }
+        .modifier(Card())
+        .disabled(workspace.busy)
+    }
+
+    private func importFolder(_ folder: URL) {
+        dismiss()
+        workspace.importCollection(folder)
+    }
 }
 
 private struct SetupView: View {
@@ -518,6 +623,7 @@ private struct SetupView: View {
 }
 
 private final class EditorState: ObservableObject {
+    @Published var showHistory = false
     @Published var marking = false
     @Published var drag: CGRect?
     @Published var editing: Cut?

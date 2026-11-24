@@ -30,6 +30,10 @@ final class Workspace: ObservableObject {
     @Published private(set) var activity = ""
     @Published private(set) var status = "粘贴链接或打开本地视频"
     @Published private(set) var cleanupStatus: String?
+    @Published private(set) var history: [HistoryEntry] = []
+    @Published private(set) var historyError: String?
+    @Published private(set) var pendingHistoryDeletion: HistoryDeletion.Plan?
+    @Published private(set) var videoTitle: String?
     @Published private(set) var currentTime = 0.0
     @Published private(set) var result: URL?
     @Published var error: String?
@@ -46,6 +50,11 @@ final class Workspace: ObservableObject {
     let player = AVPlayer()
 
     private var workspace: URL?
+    private let historyStore: HistoryStore
+    private var savedHistory: [HistoryEntry] = []
+    private var discoveredHistory: [HistoryEntry] = []
+    private var activeHistory: HistoryEntry?
+    private var historyReadFailed = false
     private var lastDownload: (link: URL, directory: URL, work: URL)?
     private var cookieFile: URL?
     private var task: Task<Void, Never>?
@@ -53,7 +62,15 @@ final class Workspace: ObservableObject {
     private var observer: Any?
     private var pendingSeek: UUID?
 
-    init() {
+    init(historyStore: HistoryStore = HistoryStore(file: Tools.support.appendingPathComponent("History.json"))) {
+        self.historyStore = historyStore
+        do {
+            savedHistory = try historyStore.read()
+            history = savedHistory
+        } catch {
+            historyReadFailed = true
+            historyError = "无法读取历史记录。现有记录文件已保留。"
+        }
         observer = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.12, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
@@ -120,7 +137,15 @@ final class Workspace: ObservableObject {
                 progress: self.progress(id)
             )
             self.activity = "载入视频"
-            try await self.load(source, directory: work)
+            let key = UUID(uuidString: work.lastPathComponent) ?? UUID()
+            var entry = self.savedHistory.first { $0.id == key } ?? HistoryEntry(
+                id: key, title: URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "v" })?.value ?? url.lastPathComponent
+            )
+            entry.original = source
+            entry.directory = work
+            entry.sourceLink = url
+            try await self.load(entry)
             var needsKey = false
             if self.duration <= 60 {
                 self.keepShortVideo()
@@ -138,8 +163,135 @@ final class Workspace: ObservableObject {
 
     func importVideo(_ url: URL) {
         launch("载入视频") { _ in
-            try await self.load(url, directory: self.makeDirectory())
+            try await self.load(HistoryEntry(id: UUID(), title: url.deletingPathExtension().lastPathComponent,
+                                             original: url, directory: self.makeDirectory()))
             self.status = "视频已载入"
+        }
+    }
+
+    func refreshHistory() async {
+        let downloads = await DownloadCleanup.jobs(in: Self.jobsRoot, currentRoot: downloadRoot, registered: downloadJobs)
+        guard !Task.isCancelled else { return }
+        discoveredHistory = HistoryStore.discover(jobs: downloads, workRoot: Self.jobsRoot, exportRoot: exportFolder)
+        updateHistoryList()
+    }
+
+    func prepareHistoryDeletion(_ entry: HistoryEntry) {
+        guard !historyReadFailed else { return }
+        launch("检查历史文件") { _ in
+            do {
+                let jobs = await DownloadCleanup.jobs(in: Self.jobsRoot, currentRoot: self.downloadRoot,
+                                                       registered: self.downloadJobs)
+                try Task.checkCancellation()
+                self.pendingHistoryDeletion = try HistoryDeletion.plan(
+                    for: entry, downloads: jobs, workRoot: Self.jobsRoot,
+                    otherEntries: self.history + [self.activeHistory].compactMap { $0 }
+                )
+                self.historyError = nil
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                self.historyError = "无法检查关联文件。\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func dismissHistoryDeletion() { pendingHistoryDeletion = nil }
+
+    func deleteHistory(_ plan: HistoryDeletion.Plan) {
+        guard !historyReadFailed, history.contains(where: { $0.id == plan.entry.id }) else { return }
+        dismissHistoryDeletion()
+        launch("删除历史记录") { _ in
+            if let job = plan.download {
+                self.downloadJobs[job.id] = job.root.path
+                if self.lastDownload?.directory.lastPathComponent == job.id { self.lastDownload = nil }
+            }
+            let paths = Set(plan.files.map(\.path))
+            if self.activeHistory?.id == plan.entry.id || [self.original, self.playable, self.repaired]
+                .compactMap({ $0 }).compactMap(DownloadCleanup.canonicalPath).contains(where: paths.contains) {
+                self.closePreview()
+                self.result = nil
+            }
+            do {
+                try await HistoryDeletion.remove(plan)
+                let remaining = self.savedHistory.filter { $0.id != plan.entry.id }
+                if remaining.count != self.savedHistory.count { try self.historyStore.write(remaining) }
+                self.savedHistory = remaining
+                self.discoveredHistory.removeAll { $0.id == plan.entry.id }
+                if let job = plan.download, job.files.allSatisfy({ paths.contains($0.path) }) {
+                    self.downloadJobs.removeValue(forKey: job.id)
+                }
+                self.updateHistoryList()
+                self.historyError = nil
+                self.status = "已删除历史记录"
+            } catch {
+                self.historyError = "删除未完成，历史记录已保留。\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func restore(_ entry: HistoryEntry) {
+        launch("打开历史任务") { _ in
+            try await self.load(entry)
+            if let link = entry.sourceLink { self.link = link.absoluteString }
+            self.status = "已打开历史任务"
+        }
+    }
+
+    func importCollection(_ folder: URL) {
+        launch("导入视频合集") { id in
+            let directory = try self.makeDirectory()
+            do {
+                let imported = try await Media.importCollection(folder, in: directory, progress: self.progress(id))
+                let title = folder.lastPathComponent.replacingOccurrences(
+                    of: #" - 分段(?: \d+)?$"#, with: "", options: .regularExpression
+                )
+                try await self.load(HistoryEntry(
+                    id: id, title: title.isEmpty ? folder.lastPathComponent : title, original: imported.source,
+                    directory: directory, collection: folder, cuts: imported.cuts
+                ))
+                self.status = "已导入 \(imported.count) 个分段，可重新处理"
+            } catch {
+                try? Tools.files.removeItem(at: directory)
+                throw error
+            }
+        }
+    }
+
+    private func updateHistoryList() {
+        let knownIDs = Set(savedHistory.map(\.id))
+        let knownOriginals = Set(savedHistory.compactMap(\.original).compactMap(DownloadCleanup.canonicalPath))
+        let knownFolders = Set(savedHistory.flatMap { $0.exports + [$0.collection].compactMap { $0 } }
+            .compactMap(DownloadCleanup.canonicalPath))
+        history = (savedHistory + discoveredHistory.filter {
+            !knownIDs.contains($0.id) &&
+                !($0.original.flatMap(DownloadCleanup.canonicalPath).map(knownOriginals.contains) ?? false) &&
+                !$0.exports.compactMap(DownloadCleanup.canonicalPath).contains(where: knownFolders.contains)
+        }).sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    @discardableResult
+    private func saveHistory() -> Bool {
+        guard !historyReadFailed, var entry = activeHistory else { return false }
+        entry.updatedAt = Date()
+        entry.preview = playable == original ? nil : playable
+        entry.repaired = repaired
+        entry.report = report
+        entry.cuts = cuts
+        entry.seeds = seeds
+        entry.analyzed = analyzed
+        entry.maskNeedsUpdate = maskNeedsUpdate
+        activeHistory = entry
+        let entries = [entry] + savedHistory.filter { $0.id != entry.id }
+        do {
+            try historyStore.write(entries)
+            savedHistory = entries
+            historyError = nil
+            updateHistoryList()
+            return true
+        } catch {
+            historyError = "无法保存历史记录。请检查本机应用数据目录。"
+            return false
         }
     }
 
@@ -176,6 +328,7 @@ final class Workspace: ObservableObject {
             var message = "已清理 \(outcome.completed.count) 个下载任务。"
             if outcome.failed > 0 { message += "\(outcome.failed) 个任务未清理完成，可重试。" }
             if remaining > 0 { message += "已停止，剩余 \(remaining) 个任务。" }
+            self.updateHistoryList()
             self.cleanupStatus = message
             self.status = message
         }
@@ -214,11 +367,13 @@ final class Workspace: ObservableObject {
     func export(to destination: URL) {
         guard let source = repaired ?? playable, let info, let original else { return }
         let cuts = self.cuts
-        let downloaded = original.lastPathComponent.hasPrefix("source.") && lastDownload != nil
-        let title = downloaded ? lastDownload?.link.lastPathComponent ?? "视频" : original.deletingPathExtension().lastPathComponent
+        let title = videoTitle ?? original.deletingPathExtension().lastPathComponent
         launch("导出视频") { id in
-            self.result = try await Media.export(source, info: info, cuts: cuts, destination: destination,
-                                                 title: title, progress: self.progress(id))
+            let exported = try await Media.export(source, info: info, cuts: cuts, destination: destination,
+                                                  title: title, progress: self.progress(id))
+            self.result = exported
+            self.activeHistory?.exports.append(exported)
+            self.saveHistory()
             self.status = "已导出 \(cuts.count + 1) 个 MP4"
         }
     }
@@ -255,6 +410,12 @@ final class Workspace: ObservableObject {
               !cuts.contains(where: { abs($0.seconds - currentTime) < 0.05 }) else { return }
         cuts.append(Cut(currentTime, "手动添加"))
         cuts.sort { $0.seconds < $1.seconds }
+        saveHistory()
+    }
+
+    func removeCut(_ id: UUID) {
+        cuts.removeAll { $0.id == id }
+        saveHistory()
     }
 
     func changeCut(_ id: UUID, to value: Double) {
@@ -266,6 +427,7 @@ final class Workspace: ObservableObject {
         let cut = cuts[position]
         cuts.sort { $0.seconds < $1.seconds }
         preview(cut)
+        saveHistory()
     }
 
     func addSeed(_ rect: CGRect) {
@@ -273,46 +435,57 @@ final class Workspace: ObservableObject {
         maskNeedsUpdate = true
         seeds.append(MaskSeed(seconds: currentTime, x: rect.minX, y: rect.minY,
                               width: rect.width, height: rect.height))
+        saveHistory()
         status = "已记录第 \(seeds.count) 个水印框，可以重新检测并修补。"
     }
 
     func clearSeeds() {
         maskNeedsUpdate = repaired != nil
         seeds.removeAll()
+        saveHistory()
         status = "已清除纠正选框"
     }
 
-    private func load(_ source: URL, directory: URL) async throws {
+    private func load(_ entry: HistoryEntry) async throws {
+        guard let source = entry.original, let directory = entry.directory, entry.canOpen else {
+            throw AppError("找不到这条历史任务的原片。若分段文件仍在，可导入合集重新处理。")
+        }
+        try Tools.files.createDirectory(at: directory, withIntermediateDirectories: true)
         let details = try await Media.probe(source, in: directory)
         let asset = AVURLAsset(url: source)
         let tracks = try? await asset.loadTracks(withMediaType: .video)
         let transform = try? await tracks?.first?.load(.preferredTransform)
         let displayTransform = transform ?? .identity
         let compatible = (try? await asset.load(.isPlayable)) == true && displayTransform.isIdentity
-        let ready = compatible ? source : try await Media.preparePlayable(source, in: directory)
+        let ready: URL
+        if let preview = entry.preview, Tools.files.isReadableFile(atPath: preview.path) {
+            ready = preview
+        } else {
+            ready = compatible ? source : try await Media.preparePlayable(source, in: directory)
+        }
         try Task.checkCancellation()
-        let oldRepair = repaired
-        let oldPreview = playable == original ? nil : playable
+        activeHistory = entry
+        videoTitle = entry.title
         original = source
         playable = ready
-        repaired = nil
+        repaired = entry.repaired.flatMap { Tools.files.isReadableFile(atPath: $0.path) ? $0 : nil }
         compareOriginal = false
         info = details
         workspace = directory
-        cuts.removeAll()
-        analyzed = false
-        seeds.removeAll()
-        maskNeedsUpdate = false
-        report = nil
-        result = nil
-        show(ready, at: 0)
-        if let oldRepair { try? Tools.files.removeItem(at: oldRepair) }
-        if let oldPreview { try? Tools.files.removeItem(at: oldPreview) }
+        cuts = entry.cuts.filter { $0.seconds > 0 && $0.seconds < details.duration }
+        analyzed = entry.analyzed
+        seeds = entry.seeds
+        maskNeedsUpdate = entry.maskNeedsUpdate || (entry.repaired != nil && repaired == nil && !seeds.isEmpty)
+        report = repaired == nil && (entry.report?.repairedFrames ?? 0) > 0 ? nil : entry.report
+        result = entry.exports.last(where: { Tools.files.fileExists(atPath: $0.path) })
+        show(repaired ?? ready, at: 0)
+        saveHistory()
     }
 
     private func keepShortVideo() {
         cuts = []
         analyzed = true
+        saveHistory()
         status = "视频不足或等于 60 秒，保留整段。"
     }
 
@@ -329,6 +502,7 @@ final class Workspace: ObservableObject {
         try Task.checkCancellation()
         cuts = suggestions
         analyzed = true
+        saveHistory()
         status = cuts.isEmpty ? "未找到可靠切点，已保留整段供复核。" : "已找到 \(cuts.count) 个切点"
     }
 
@@ -344,7 +518,7 @@ final class Workspace: ObservableObject {
         maskNeedsUpdate = false
         compareOriginal = false
         show(video ?? source, at: time)
-        if let old { try? Tools.files.removeItem(at: old) }
+        if saveHistory(), let old { try? Tools.files.removeItem(at: old) }
         status = report.detected == 0
             ? "未检测到可靠的水印，可框选疑似水印后重新处理。"
             : "已处理 \(report.repairedFrames) 帧，\(report.uncertain.count) 处待复核。"
@@ -365,6 +539,8 @@ final class Workspace: ObservableObject {
         player.pause()
         player.replaceCurrentItem(with: nil)
         pendingSeek = nil
+        activeHistory = nil
+        videoTitle = nil
         original = nil
         playable = nil
         repaired = nil

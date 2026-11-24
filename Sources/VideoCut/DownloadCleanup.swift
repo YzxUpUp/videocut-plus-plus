@@ -53,15 +53,10 @@ struct DownloadCleanup {
             let work = jobsRoot.appendingPathComponent(id, isDirectory: true)
             guard isJobFolder(download), root.path == canonicalPath(root) else { return nil }
             let output = children(of: download).filter { isSource($0) || matchesRegular($0, cookiePattern) }
-            let internalFiles = isJobFolder(work) ? children(of: work) : []
-            var removable = internalFiles.filter { matchesRegular($0, cachePattern) }
-            let samples = work.appendingPathComponent("samples", isDirectory: true)
-            if isDirectory(samples) {
-                removable += children(of: samples).filter { matchesRegular($0, framePattern) }
-            }
-            let removableFiles = removable + output
+            let cache = processingFiles(in: work)
+            let removableFiles = cache.files + output
             guard !removableFiles.isEmpty else { return nil }
-            let folders = download.path == work.path ? [samples, work] : [samples, work, download]
+            let folders = download.path == work.path ? cache.folders : cache.folders + [download]
             return Job(id: id, root: root, folders: folders, files: removableFiles)
         }
     }
@@ -71,29 +66,46 @@ struct DownloadCleanup {
         for job in jobs {
             if Task.isCancelled { break }
             do {
-                for file in job.files {
-                    // Recheck the path before removing it. A replaced directory
-                    // or symlink should never redirect deletion outside the job.
-                    guard file.path == canonicalPath(file), isRegular(file) else { continue }
-                    // unlink cannot recursively remove a directory that replaced this file.
-                    if unlink(file.path) != 0, errno != ENOENT {
-                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                    }
-                }
-                for folder in job.folders where isDirectory(folder) {
-                    guard folder.path == canonicalPath(folder),
-                          try files.contentsOfDirectory(atPath: folder.path).isEmpty else { continue }
-                    // rmdir is atomic and cannot erase a file added after the empty check.
-                    if rmdir(folder.path) != 0, errno != ENOTEMPTY, errno != ENOENT {
-                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                    }
-                }
+                try removeFiles(job.files, emptyFolders: job.folders)
                 result.completed.append(job.id)
             } catch {
                 result.failed += 1
             }
         }
         return result
+    }
+
+    static func processingFiles(in work: URL) -> (files: [URL], folders: [URL]) {
+        let samples = work.appendingPathComponent("samples", isDirectory: true)
+        guard isJobFolder(work) else { return ([], []) }
+        let generated = children(of: work).filter { matchesRegular($0, cachePattern) }
+        let frames = isDirectory(samples) ? children(of: samples).filter { matchesRegular($0, framePattern) } : []
+        return (generated + frames, [samples, work])
+    }
+
+    static func removeFiles(_ targets: [URL], emptyFolders: [URL]) throws {
+        for file in targets {
+            try Task.checkCancellation()
+            let target = URL(fileURLWithPath: file.path)
+            var attributes = stat()
+            if lstat(target.path, &attributes) != 0 {
+                if errno == ENOENT { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard target.path == canonicalPath(target), isRegular(target) else {
+                throw AppError("文件位置已变化，请重新确认后再试。")
+            }
+            // unlink cannot recursively remove a directory that replaced this file.
+            if unlink(target.path) != 0, errno != ENOENT {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+        for folder in emptyFolders where isDirectory(folder) && folder.path == canonicalPath(folder) {
+            // rmdir only removes empty folders, including when other files were added later.
+            if rmdir(folder.path) != 0, errno != ENOTEMPTY, errno != EEXIST, errno != ENOENT {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
     }
 
     private static func children(of directory: URL) -> [URL] {

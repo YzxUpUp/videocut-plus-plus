@@ -10,6 +10,11 @@ enum LocalChecks {
         print("链接、切点和两家 API 响应解析检查通过")
         try await checkDownloadCleanup()
         print("下载清理、导出保留和目录边界检查通过")
+        try checkHistory()
+        try await checkHistoryDeletion()
+        if let path = ProcessInfo.processInfo.environment["VIDEOCUT_TEST_COLLECTION"] {
+            try await checkCollection(path)
+        }
         if let link = ProcessInfo.processInfo.environment["VIDEOCUT_TEST_LINK"] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -115,6 +120,101 @@ enum LocalChecks {
         check((keepFiles + [symlink]).allSatisfy { fm.fileExists(atPath: $0.path) })
         let repeated = await DownloadCleanup.jobs(in: jobs, currentRoot: current, registered: [:])
         check(repeated.isEmpty)
+    }
+
+    private static func checkHistory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HistoryStore(file: root.appendingPathComponent("History.json"))
+        check(try store.read().isEmpty)
+        let cut = Cut(32.5, "测试切点")
+        let source = root.appendingPathComponent("source.mp4")
+        let export = root.appendingPathComponent("分段")
+        let earlier = HistoryEntry(id: UUID(), title: "旧条目", updatedAt: .distantPast)
+        let latest = HistoryEntry(id: UUID(), title: "新条目", original: source,
+                                  directory: root, cuts: [cut], exports: [export])
+        try store.write([earlier, latest])
+        let records = try store.read()
+        equal(records.map(\.id), [latest.id, earlier.id])
+        equal(records.first?.cuts, [cut])
+        equal(records.first?.exports, [export])
+        equal(records.first?.canOpen, false)
+        print("历史记录保存、恢复和缺失原片状态检查通过")
+    }
+
+    private static func checkHistoryDeletion() async throws {
+        let fm = FileManager.default
+        let temporary = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: temporary) }
+        let jobs = temporary.appendingPathComponent("Jobs", isDirectory: true)
+        let id = UUID()
+        let work = jobs.appendingPathComponent(id.uuidString, isDirectory: true)
+        let output = temporary.appendingPathComponent("普通导出", isDirectory: true)
+        let shared = temporary.appendingPathComponent("共享导出", isDirectory: true)
+        let input = temporary.appendingPathComponent("原始合集", isDirectory: true)
+        let localFile = temporary.appendingPathComponent("本地原片.mp4")
+        let combined = work.appendingPathComponent("collection.mp4")
+        let generated = [
+            combined, work.appendingPathComponent("samples/000001.jpg"),
+            output.appendingPathComponent("01.mp4"), output.appendingPathComponent("02.mp4")
+        ]
+        let preserved = [
+            localFile, input.appendingPathComponent("01.mp4"), output.appendingPathComponent("备注.txt"),
+            shared.appendingPathComponent("01.mp4"), work.appendingPathComponent("备注.txt")
+        ]
+        for url in generated + preserved {
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("fixture".utf8).write(to: url)
+        }
+        try fm.createSymbolicLink(at: output.appendingPathComponent("03.mp4"), withDestinationURL: localFile)
+        let entry = HistoryEntry(id: id, title: "任务", original: combined, directory: work,
+                                 collection: input, exports: [output, shared])
+        let peer = HistoryEntry(id: UUID(), title: "另一任务", original: generated.last, collection: shared)
+        let plan = try HistoryDeletion.plan(for: entry, downloads: [], workRoot: jobs, otherEntries: [entry, peer])
+        check(plan.message.contains("删除后无法恢复"))
+        check(generated.allSatisfy { fm.fileExists(atPath: $0.path) })
+        let expected = generated.dropLast().compactMap(DownloadCleanup.canonicalPath)
+        equal(Set(plan.files.map(\.path)), Set(expected))
+        let clip = generated[2]
+        let backup = clip.deletingLastPathComponent().appendingPathComponent("移走的分段.mp4")
+        try fm.moveItem(at: clip, to: backup)
+        try Data("replacement".utf8).write(to: clip)
+        do {
+            try await HistoryDeletion.remove(plan)
+            preconditionFailure("应当拒绝已被替换的文件")
+        } catch {
+            check(generated.allSatisfy { fm.fileExists(atPath: $0.path) })
+        }
+        check(try String(contentsOf: clip, encoding: .utf8) == "replacement")
+        try fm.removeItem(at: clip)
+        try fm.moveItem(at: backup, to: clip)
+        try await HistoryDeletion.remove(plan)
+        check(generated.dropLast().allSatisfy { !fm.fileExists(atPath: $0.path) })
+        check((preserved + [generated.last!]).allSatisfy { fm.fileExists(atPath: $0.path) })
+
+        let importEntry = HistoryEntry(id: id, title: "导入原片", original: localFile, directory: work)
+        let importPlan = try HistoryDeletion.plan(for: importEntry, downloads: [], workRoot: jobs, otherEntries: [])
+        check(importPlan.files.isEmpty)
+        try await HistoryDeletion.remove(importPlan)
+        check(fm.fileExists(atPath: localFile.path))
+        print("历史删除预检、关联文件清理和共享文件保护检查通过")
+    }
+
+    private static func checkCollection(_ path: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = URL(fileURLWithPath: path, isDirectory: true)
+        let clips = try Media.collectionClips(in: folder)
+        let joined = try await Media.importCollection(folder, in: root) { _ in }
+        let info = try await Media.probe(joined.source, in: root)
+        equal(joined.count, clips.count)
+        equal(joined.cuts.count, clips.count - 1)
+        equal(joined.cuts.map(\.reason), clips.dropFirst().map { "原合集分段 · " + $0.lastPathComponent })
+        check(joined.cuts.last.map { $0.seconds < info.duration } ?? true)
+        let clipsAfter = try Media.collectionClips(in: folder)
+        equal(clipsAfter, clips)
+        print("已合并 \(joined.count) 个片段，保留 \(joined.cuts.count) 个切点，时长 \(info.duration) 秒")
     }
 
     private static func checkVisionRequests(info: MediaInfo, frames: [FrameSample],

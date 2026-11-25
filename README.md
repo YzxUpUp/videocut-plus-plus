@@ -1,5 +1,9 @@
 # VideoCut++
 
+[简体中文](#简体中文) · [English](#english) · [下载 / Download](https://github.com/YzxUpUp/videocut-plus-plus/releases/latest)
+
+## 简体中文
+
 适用于 Apple Silicon Mac 的视频剪辑工具，要求 macOS 14 或更新版本。下载并解压后打开 `VideoCut++.app`，可粘贴 B 站、YouTube 或抖音链接，也可打开本地视频。[下载最新版](https://github.com/YzxUpUp/videocut-plus-plus/releases/latest)
 
 1. 打开右上角设置，选择 OpenAI GPT 或智谱 GLM，填写并保存 API Key，再点「测试连接」。设置页会显示本机依赖状态，也可在「界面外观」切换明亮、黑暗或跟随系统。默认跟随系统。
@@ -13,7 +17,7 @@
 
 「设置 → 存储位置 → 清理下载内容」会永久删除应用记录的下载原片和相关处理文件，并保留已导出的 MP4。清理前会提示确认，清理后无法复原。
 
-## 历史与合集
+### 历史与合集
 
 点顶栏「历史」可打开已保存的任务，继续调整切点或水印框。历史会记录每次导出的分段目录，可选择「重新处理合集」打开这些 MP4。清理下载后，只要导出的文件还在，就可以继续用合集重新处理。
 
@@ -21,7 +25,32 @@
 
 历史条目的「删除…」会先显示关联文件的位置。确认「永久删除」后，应用会移除这条记录及其下载原片、处理缓存和导出的分段。删除后无法恢复。外部导入的源文件以及其他历史任务仍引用的文件会保留。
 
-## 本地构建和检查
+## English
+
+VideoCut++ is a video editor for Apple Silicon Macs running macOS 14 or later. Download and unzip the app, then open `VideoCut++.app`. Paste a Bilibili, YouTube, or Douyin link, or open a local video. [Download the latest release](https://github.com/YzxUpUp/videocut-plus-plus/releases/latest)
+
+1. Open Settings, choose OpenAI GPT or Zhipu GLM, save your API key, and click Test Connection («测试连接»). Settings shows which local dependencies are installed. Under Appearance («界面外观»), choose Light, Dark, or Follow System. Follow System is the default.
+2. Paste a video link and click Download and Prepare («下载并准备剪辑»). For a local video, click AI Analysis («AI 分析») and Detect and Repair («检测并修补»).
+3. Click a cut point to jump to that moment and pause the preview. You can add, move, or remove cut points. Use View Original («查看原片») to compare the repair with the source. If a section needs review, jump to it, draw a box around the watermark on the original, and rerun the repair.
+4. Click Export MP4 («导出 MP4»). The app uses your configured export folder or asks where to save the files. Each export creates its own folder with numbered clips.
+
+Each segment targets about 60 seconds. Actual lengths depend on where the content naturally breaks. Downloads are saved in per-task folders under `~/Library/Application Support/VideoCut++/Jobs` by default. In Settings → Storage («存储位置»), you can change the download and MP4 export folders. Existing files stay where they are.
+
+AI analysis sends thumbnails, timestamps, and a locally generated transcript to the provider you select. Watermark repair and video editing run on your Mac. Repair may leave visible traces when a large or moving watermark covers the subject.
+
+Douyin sometimes requires a fresh cookie. You can select your own Netscape-format cookie file in Settings. The app temporarily copies only the Douyin entries for the download. You can also open a local video.
+
+In Settings → Storage, Clear Downloads («清理下载内容») permanently removes downloads tracked by the app and their processing files. It asks for confirmation and keeps exported MP4s. Deleted files cannot be restored.
+
+### History and collections
+
+Click History («历史») in the toolbar to reopen saved tasks and continue editing cut points or watermark boxes. History keeps a link to each export folder. Select Reprocess Collection («重新处理合集») to work with those MP4s again. Exported collections can be reprocessed after their downloads have been cleared.
+
+To import an older export, choose History → Import Collection («导入合集…») and select the folder containing files such as `01.mp4` and `02.mp4`. The app combines them in numeric filename order in its working folder and adds cut points at the original segment boundaries. You can run AI analysis, repair watermarks, or export again. The input files are preserved.
+
+Select Delete («删除…») on a history entry to review the affected file locations. Confirming permanent deletion removes the record, its downloaded source, processing files, and exported segments. This cannot be undone. Files imported from outside the app and files referenced by other history entries are preserved.
+
+## 本地构建和检查 / Build and checks
 
 ```sh
 bash Tools/setup.sh
